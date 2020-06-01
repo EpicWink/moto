@@ -144,7 +144,7 @@ class SWFBackend(BaseBackend):
         if _type:
             raise SWFTypeAlreadyExistsFault(_type)
         _class = KNOWN_SWF_TYPES[kind]
-        _type = _class(name, version, **kwargs)
+        _type = _class(name, version, **kwargs, region_name=self.region_name)
         domain.add_type(_type)
 
     def deprecate_type(self, kind, domain_name, name, version):

@@ -1,5 +1,7 @@
 from __future__ import unicode_literals
 import uuid
+import json
+from concurrent import futures
 
 from moto.core import BaseModel
 from moto.core.utils import camelcase_to_underscores, unix_time
@@ -83,6 +85,7 @@ class WorkflowExecution(BaseModel):
         # child workflows
         self.child_workflow_executions = []
         self._previous_started_event_id = None
+        self._lambda_executor = futures.ThreadPoolExecutor(max_workers=1)
 
     def __repr__(self):
         return "WorkflowExecution(run_id: {0})".format(self.run_id)
@@ -407,6 +410,8 @@ class WorkflowExecution(BaseModel):
                 self.fail(event_id, attributes.get("details"), attributes.get("reason"))
             elif decision_type == "ScheduleActivityTask":
                 self.schedule_activity_task(event_id, attributes)
+            elif decision_type == "ScheduleLambdaFunction":
+                self.schedule_lambda_function(event_id, attributes)
             else:
                 # TODO: implement Decision type: CancelTimer
                 # TODO: implement Decision type: CancelWorkflowExecution
@@ -414,7 +419,6 @@ class WorkflowExecution(BaseModel):
                 # TODO: implement Decision type: RecordMarker
                 # TODO: implement Decision type: RequestCancelActivityTask
                 # TODO: implement Decision type: RequestCancelExternalWorkflowExecution
-                # TODO: implement Decision type: ScheduleLambdaFunction
                 # TODO: implement Decision type: SignalExternalWorkflowExecution
                 # TODO: implement Decision type: StartChildWorkflowExecution
                 # TODO: implement Decision type: StartTimer
@@ -539,6 +543,96 @@ class WorkflowExecution(BaseModel):
         self.domain.add_to_activity_task_list(task_list, task)
         self.open_counts["openActivityTasks"] += 1
         self.latest_activity_task_timestamp = unix_time()
+
+    def _invoke_lambda(self, fn, attributes, scheduled_event_id):
+        # TODO: StartLambdaFunctionFailed when no/bad IAM role
+        started = self._add_event(
+            "lambdaFunctionStartedEventAttributes",
+            scheduledEventId=scheduled_event_id,
+        )
+
+        body = ""
+        if "input" in attributes:
+            body = json.dumps(attributes["input"])
+        headers = {}
+        response_headers = {}
+        payload = fn.invoke(body, headers, response_headers)
+        payload_ = json.loads(payload)
+
+        # TODO: handle time-out
+
+        if response_headers["StatusCode"] // 100 != 2:
+            self._add_event(
+                "lambdaFunctionFailedEventAttributes",
+                scheduledEventId=scheduled_event_id,
+                startedEventId=started.event_id,
+                reason=json.dumps(payload_["reason"]),
+                details=json.dumps(payload_["details"]) if "details" in payload_ else None,
+            )
+        else:
+            self._add_event(
+                "lambdaFunctionCompletedEventAttributes",
+                scheduledEventId=scheduled_event_id,
+                startedEventId=started.event_id,
+                result=payload,
+            )
+        self.should_schedule_decision_next = True
+
+        self.open_counts["openLambdaFunctions"] -= 1
+
+    def schedule_lambda_function(self, event_id, attributes):
+        from ...awslambda import lambda_backends
+
+        # Get Lambda function
+        lambda_backend = lambda_backends[self.workflow_type.region_name]
+        fn = lambda_backend.get_function(attributes["name"])
+        if not fn:
+            self._add_event(
+                "ScheduleLambdaFunctionFailed",
+                id=attributes["id"],
+                name=attributes["name"],
+                cause=spam,
+                decision_task_completed_event_id=event_id,
+            )
+            self.should_schedule_decision_next = True
+            return
+
+        # Check activity ID
+        if any(
+            at
+            for at in self.activity_tasks
+            if at.activity_id == attributes["activityId"]
+        ):
+            self._add_event(
+                "ScheduleLambdaFunctionFailed",
+                id=attributes["id"],
+                name=attributes["name"],
+                cause="ACTIVITY_ID_ALREADY_IN_USE",
+                decision_task_completed_event_id=event_id,
+            )
+            self.should_schedule_decision_next = True
+            return
+
+        # TODO: Other Lambda schedule failures
+        # OPEN_LAMBDA_FUNCTIONS_LIMIT_EXCEEDED
+        # LAMBDA_FUNCTION_CREATION_RATE_EXCEEDED
+        # LAMBDA_SERVICE_NOT_AVAILABLE_IN_REGION
+
+        # Add event
+        evt = self._add_event(
+            "ActivityTaskScheduled",
+            id=attributes["id"],
+            name=attributes["name"],
+            control=attributes.get("control"),
+            decision_task_completed_event_id=event_id,
+            input=attributes.get("input"),
+            start_to_close_timeout=attributes.get("startToCloseTimeout"),
+        )
+
+        # Start Lambda
+        self._lambda_executor.submit(self._invoke_lambda, fn, attributes, evt.event_id)
+
+        self.open_counts["openLambdaFunctions"] += 1
 
     def _find_activity_task(self, task_token):
         for task in self.activity_tasks:
