@@ -101,11 +101,18 @@ class _DockerDataVolumeContext:
         self._lambda_func = lambda_func
         self._vol_ref = None
 
+    def __enter__(self):
+        self.start()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.stop()
+
     @property
     def name(self):
         return self._vol_ref.volume.name
 
-    def __enter__(self):
+    def start(self):
         # See if volume is already known
         with self.__class__._lock:
             self._vol_ref = self.__class__._data_vol_map[self._lambda_func.code_sha_256]
@@ -136,9 +143,7 @@ class _DockerDataVolumeContext:
             finally:
                 container.remove(force=True)
 
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
+    def stop(self):
         with self.__class__._lock:
             self._vol_ref.refcount -= 1
             if self._vol_ref.refcount == 0:
@@ -240,6 +245,7 @@ class LambdaFunction(BaseModel):
         )
 
         self.tags = dict()
+        self._executions = {}
 
     def set_version(self, version):
         self.function_arn = make_function_ver_arn(
@@ -375,13 +381,12 @@ class LambdaFunction(BaseModel):
         except Exception:
             return s
 
-    def _invoke_lambda(self, code, event=None, context=None):
+    def _start_invocation(self, code, event=None, context=None):
         # TODO: context not yet implemented
         if event is None:
             event = dict()
         if context is None:
             context = {}
-        output = None
 
         try:
             # TODO: I believe we can keep the container running and feed events as needed
@@ -397,42 +402,60 @@ class LambdaFunction(BaseModel):
 
             env_vars.update(self.environment_vars)
 
-            container = exit_code = None
             log_config = docker.types.LogConfig(type=docker.types.LogConfig.types.JSON)
-            with _DockerDataVolumeContext(self) as data_vol:
-                try:
-                    run_kwargs = (
-                        dict(links={"motoserver": "motoserver"})
-                        if settings.TEST_SERVER_MODE
-                        else {}
-                    )
-                    container = self.docker_client.containers.run(
-                        "lambci/lambda:{}".format(self.run_time),
-                        [self.handler, json.dumps(event)],
-                        remove=False,
-                        mem_limit="{}m".format(self.memory_size),
-                        volumes=["{}:/var/task".format(data_vol.name)],
-                        environment=env_vars,
-                        detach=True,
-                        log_config=log_config,
-                        **run_kwargs
-                    )
-                finally:
-                    if container:
-                        try:
-                            exit_code = container.wait(timeout=300)
-                        except requests.exceptions.ReadTimeout:
-                            exit_code = -1
-                            container.stop()
-                            container.kill()
-                        else:
-                            if docker_3:
-                                exit_code = exit_code["StatusCode"]
+            data_vol = _DockerDataVolumeContext(self)
+            data_vol.start()
+            run_kwargs = (
+                dict(links={"motoserver": "motoserver"})
+                if settings.TEST_SERVER_MODE
+                else {}
+            )
+            container = self.docker_client.containers.run(
+                "lambci/lambda:{}".format(self.run_time),
+                [self.handler, json.dumps(event)],
+                remove=False,
+                mem_limit="{}m".format(self.memory_size),
+                volumes=["{}:/var/task".format(data_vol.name)],
+                environment=env_vars,
+                detach=True,
+                log_config=log_config,
+                **run_kwargs
+            )
+            # Possible Docker exceptions:
+            # docker.errors.ImageNotFound
+            # docker.errors.APIError
 
-                        output = container.logs(stdout=False, stderr=True)
-                        output += container.logs(stdout=True, stderr=False)
-                        container.remove()
+            handle = str(uuid.uuid4())
+            self._executions[handle] = (container, None)
+            return handle
+        except Exception as e:
+            return e
 
+    def _wait_for_invocation(self, handle, timeout=300):
+        try:
+            container = self._executions[handle]
+            try:
+                exit_code = container.wait(timeout=timeout)
+            except requests.exceptions.ReadTimeout:
+                exit_code = -1
+                container.stop()
+                container.kill()
+            else:
+                if docker_3:
+                    exit_code = exit_code["StatusCode"]
+            self._executions[handle] = (container, exit_code)
+            return exit_code
+        except Exception as e:
+            return e
+
+    def _get_result_of_invocation(self, handle):
+        output = None
+        try:
+            container, exit_code = self._executions[handle]
+
+            output = container.logs(stdout=False, stderr=True)
+            output += container.logs(stdout=True, stderr=False)
+            container.remove()
             output = output.decode("utf-8")
 
             # Send output to "logs" backend
@@ -470,12 +493,24 @@ class LambdaFunction(BaseModel):
             )
             return "error running lambda: {}".format(e), True, logs
 
+    def _invoke_lambda(self, code, event=None, context=None):
+        handle = self._start_invocation(code=code, event=event, context=context)
+        if isinstance(handle, Exception):
+            return "error running lambda: {}".format(handle), True, ""
+        exc = self._wait_for_invocation(handle)
+        if isinstance(exc, Exception):
+            return "error running lambda: {}".format(exc), True, ""
+        return self._get_result_of_invocation(handle)
+
     def invoke(self, body, request_headers, response_headers):
 
         if body:
             body = json.loads(body)
 
-        # Get the invocation type:
+        if request_headers.get("x-amz-invocation-type") == "Event":
+            self._start_lambda(code=self.code, event=body)
+            return None
+
         res, errored, logs = self._invoke_lambda(code=self.code, event=body)
         if request_headers.get("x-amz-invocation-type") == "RequestResponse":
             encoded = base64.b64encode(logs.encode("utf-8"))
@@ -487,6 +522,11 @@ class LambdaFunction(BaseModel):
             response_headers["x-amz-function-error"] = "Handled"
 
         return result
+
+    def invoke_async(self, body, request_headers, response_headers):
+        request_headers = request_headers.copy()
+        request_headers["X-Amz-Invocation-Type"] = "Event"
+        return self.invoke(body, request_headers, response_headers)
 
     @classmethod
     def create_from_cloudformation_json(

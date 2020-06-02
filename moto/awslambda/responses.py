@@ -182,15 +182,15 @@ class LambdaResponse(BaseResponse):
             function_name, qualifier, self.body, self.headers, response_headers
         )
         if payload:
-            if request.headers.get("X-Amz-Invocation-Type") == "Event":
-                status_code = 202
-            elif request.headers.get("X-Amz-Invocation-Type") == "DryRun":
+            if request.headers.get("X-Amz-Invocation-Type") == "DryRun":
                 status_code = 204
             else:
                 if request.headers.get("X-Amz-Log-Type") != "Tail":
                     del response_headers["x-amz-log-result"]
                 status_code = 200
             return status_code, response_headers, payload
+        elif request.headers.get("X-Amz-Invocation-Type") == "Event":
+            return 202, response_headers, ""
         else:
             return 404, response_headers, "{}"
 
@@ -201,7 +201,7 @@ class LambdaResponse(BaseResponse):
 
         fn = self.lambda_backend.get_function(function_name, None)
         if fn:
-            payload = fn.invoke(self.body, self.headers, response_headers)
+            payload = fn.invoke_async(self.body, self.headers, response_headers)
             response_headers["Content-Length"] = str(len(payload))
             return 202, response_headers, payload
         else:
